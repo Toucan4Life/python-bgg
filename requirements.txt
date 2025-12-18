@@ -1,6 +1,5 @@
-ipywidgets==8.1.2
 matplotlib==3.8.4
 pandas==2.2.2
 ipykernel==6.24.0
-dask
-dask distributed
+
+netbone==0.2.3
