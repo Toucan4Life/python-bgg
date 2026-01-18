@@ -64,6 +64,9 @@ class TMFG:
         weights: Union[np.ndarray, pd.DataFrame],
         output: str,
         cov: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        communities: Optional[Union[np.ndarray, list[int]]] = None,
+        intra_boost: float = 1.0,
+        inter_penalty: float = 1.0,
     ) -> None:
         """
         The `fit` method is a member of the `TMFG` class. It is used to fit
@@ -81,6 +84,18 @@ class TMFG:
             - sparse weighted weights matrix (output = 'weighted_sparse_W_matrix')
         cov : np.ndarray or pd.DataFrame, optional
             The covariance matrix. Default is None.
+        communities : np.ndarray or list[int], optional
+            Optional community membership array of length N (number of vertices).
+            When provided, the input `weights` are reweighted to prioritize
+            intra-community edges by multiplying entries where nodes share the
+            same community by `intra_boost` and inter-community entries by
+            `inter_penalty`.
+        intra_boost : float, default 1.0
+            Multiplicative factor applied to weights for pairs of nodes within
+            the same community.
+        inter_penalty : float, default 1.0
+            Multiplicative factor applied to weights for pairs of nodes in
+            different communities.
         """
         if isinstance(weights, pd.DataFrame):
             weights = weights.to_numpy()
@@ -90,6 +105,19 @@ class TMFG:
             if isinstance(cov, pd.DataFrame):
                 cov = cov.to_numpy()
             self._cov = cov.copy()
+
+        # Optionally bias the weights by communities to encourage
+        # intra-community connectivity in the resulting TMFG.
+        if communities is not None:
+            comm_arr = np.asarray(communities)
+            if comm_arr.ndim != 1 or comm_arr.shape[0] != self._W.shape[0]:
+                raise ValueError(
+                    "communities must be a 1D array of length equal to the number of vertices"
+                )
+            same_comm = (comm_arr[:, None] == comm_arr[None, :])
+            # Avoid modifying diagonal here; it will be zeroed in _initialize
+            bias_mat = np.where(same_comm, float(intra_boost), float(inter_penalty))
+            self._W = self._W * bias_mat
 
         self._output_mode = OutputMode(output)
 
