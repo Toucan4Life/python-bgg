@@ -1,6 +1,7 @@
 import heapq
 import numpy as np
 import pandas as pd
+from scipy import sparse as sp
 
 from enum import Enum
 from typing import Union, Optional
@@ -28,9 +29,9 @@ class TMFG:
 
     Attributes
     ----------
-    _W : np.ndarray
+    _W : np.ndarray | sp.spmatrix
         The input correlation (or similarity) matrix.
-    _cov : np.ndarray
+    _cov : np.ndarray | sp.spmatrix
         The covariance matrix.
     _output_mode : OutputMode
         The desired output mode.
@@ -99,12 +100,15 @@ class TMFG:
         """
         if isinstance(weights, pd.DataFrame):
             weights = weights.to_numpy()
-        self._W = weights.copy()
+        # Accept dense, pandas, or scipy.sparse inputs without materializing a full dense matrix
+        if isinstance(weights, pd.DataFrame):
+            weights = weights.to_numpy()
+        self._W = weights.copy() if not sp.isspmatrix(weights) else weights.copy()
 
         if cov is not None:
             if isinstance(cov, pd.DataFrame):
                 cov = cov.to_numpy()
-            self._cov = cov.copy()
+            self._cov = cov.copy() if not sp.isspmatrix(cov) else cov.copy()
 
         # Optionally bias the weights by communities to encourage
         # intra-community connectivity in the resulting TMFG.
@@ -114,10 +118,20 @@ class TMFG:
                 raise ValueError(
                     "communities must be a 1D array of length equal to the number of vertices"
                 )
-            same_comm = (comm_arr[:, None] == comm_arr[None, :])
-            # Avoid modifying diagonal here; it will be zeroed in _initialize
-            bias_mat = np.where(same_comm, float(intra_boost), float(inter_penalty))
-            self._W = self._W * bias_mat
+            if sp.isspmatrix(self._W):
+                # Reweight only nonzero entries to avoid dense broadcasting
+                W_csr = self._W.tocsr()
+                rows, cols = W_csr.nonzero()
+                same = comm_arr[rows] == comm_arr[cols]
+                # Build multiplier vector aligned to data
+                mult = np.where(same, float(intra_boost), float(inter_penalty)).astype(W_csr.data.dtype)
+                W_csr.data *= mult
+                self._W = W_csr
+            else:
+                same_comm = (comm_arr[:, None] == comm_arr[None, :])
+                # Avoid modifying diagonal here; it will be zeroed in _initialize
+                bias_mat = np.where(same_comm, float(intra_boost), float(inter_penalty))
+                self._W = self._W * bias_mat
 
         self._output_mode = OutputMode(output)
 
@@ -203,7 +217,16 @@ class TMFG:
         self._triangles = [[vx, vy, vz], [vx, vy, vw], [vx, vz, vw], [vy, vz, vw]]
 
         self._remaining_vertices_mask[c0] = False
-        np.fill_diagonal(self._W, 0)
+        # Zero diagonal without densifying
+        if sp.isspmatrix(self._W):
+            self._W = self._W.tocsr()
+            self._W.setdiag(0)
+            self._W.eliminate_zeros()
+            # Keep a CSC copy for efficient column access
+            self._W_csc = self._W.tocsc()
+        else:
+            np.fill_diagonal(self._W, 0)
+            self._W_csc = None
 
         self._triangle_columns_sum_cache = {}
         for i, t in enumerate(self._triangles):
@@ -259,8 +282,20 @@ class TMFG:
         np.ndarray
             Array of 4 vertex indices forming the initial 4-clique.
         """
-        mean_val = np.mean(self._W)
-        v = np.sum(np.multiply(self._W, (self._W > mean_val)), axis=1)
+        if sp.isspmatrix(self._W):
+            # Mean over all entries including zeros
+            mean_val = float(self._W.sum()) / float(self._N * self._N)
+            W_csr = self._W.tocsr()
+            v = np.zeros(self._N, dtype=float)
+            indptr = W_csr.indptr
+            data = W_csr.data
+            for i in range(self._N):
+                row_vals = data[indptr[i] : indptr[i + 1]]
+                if row_vals.size:
+                    v[i] = float(row_vals[row_vals > mean_val].sum())
+        else:
+            mean_val = np.mean(self._W)
+            v = np.sum(np.multiply(self._W, (self._W > mean_val)), axis=1)
         # [::-1] added to prevent regression, but it is not needed
         return list(np.argsort(v)[-4:][::-1])
 
@@ -283,9 +318,18 @@ class TMFG:
             edges to the triangle vertices.
         """
         if triangle not in self._triangle_columns_sum_cache:
-            self._triangle_columns_sum_cache[triangle] =  (
-                self._W[:, triangle[0]] + self._W[:, triangle[1]] + self._W[:, triangle[2]]
-            )
+            if sp.isspmatrix(self._W):
+                # Sum of three columns as a dense 1D vector of length N
+                colsum = (
+                    self._W_csc[:, triangle[0]]
+                    + self._W_csc[:, triangle[1]]
+                    + self._W_csc[:, triangle[2]]
+                ).toarray().ravel()
+                self._triangle_columns_sum_cache[triangle] = colsum
+            else:
+                self._triangle_columns_sum_cache[triangle] = (
+                    self._W[:, triangle[0]] + self._W[:, triangle[1]] + self._W[:, triangle[2]]
+                )
         return self._triangle_columns_sum_cache[triangle]
 
     def _get_best_gain(self, triangle: list[int]) -> tuple[int, float]:
@@ -389,10 +433,18 @@ class TMFG:
 
         JS[i, j] = 1 if there is an edge between i and j in the TMFG, and 0 otherwise.
         """
-        self._J = np.zeros((self._N, self._N))
+        # Build sparse symmetric adjacency
+        J = sp.lil_matrix((self._N, self._N), dtype=np.int8)
         for c in self._cliques:
-            self._J[np.ix_(c, c)] = 1
-        np.fill_diagonal(self._J, 0)
+            # 4-clique → 6 undirected edges
+            for a in range(len(c)):
+                for b in range(a + 1, len(c)):
+                    i, j = c[a], c[b]
+                    J[i, j] = 1
+                    J[j, i] = 1
+        # Ensure diagonal zero
+        J.setdiag(0)
+        self._J = J.tocsr()
 
     def _weighted_sparse_W_matrix(self):
         """
@@ -401,17 +453,40 @@ class TMFG:
         -1 <= 0 <= 1 for each pair of vertices that are connected in the TMFG
         and a value of 0 for each pair that are disconnected.
         """
-        self._J = np.zeros((self._N, self._N))
+        J = sp.lil_matrix((self._N, self._N), dtype=float)
         for c in self._cliques:
-            self._J[np.ix_(c, c)] = self._W[np.ix_(c, c)]
-        np.fill_diagonal(self._J, 0)
+            for a in range(len(c)):
+                for b in range(a + 1, len(c)):
+                    i, j = c[a], c[b]
+                    if sp.isspmatrix(self._W):
+                        val = float(self._W[i, j])
+                    else:
+                        val = float(self._W[i, j])
+                    J[i, j] = val
+                    J[j, i] = val
+        J.setdiag(0)
+        self._J = J.tocsr()
 
     def _logo(self):
         """
         Construct the sparse inverse covariance matrix of the TMFG.
         """
-        self._J = np.zeros((self._N, self._N))
+        # NOTE: LOGO mode builds small dense inverses; keep result sparse to save memory
+        # IMPORTANT: LOGO inverse covariance should preserve diagonal values
+        J = sp.lil_matrix((self._N, self._N), dtype=float)
         for c in self._cliques:
-            self._J[np.ix_(c, c)] += inv(self._cov[np.ix_(c, c)])
+            block = self._cov[np.ix_(c, c)]
+            block = block.toarray() if sp.isspmatrix(block) else block
+            inv_block = inv(block)
+            for ii, i in enumerate(c):
+                for jj, j in enumerate(c):
+                    J[i, j] += inv_block[ii, jj]
         for s in self._separators:
-            self._J[np.ix_(s, s)] -= inv(self._cov[np.ix_(s, s)])
+            block = self._cov[np.ix_(s, s)]
+            block = block.toarray() if sp.isspmatrix(block) else block
+            inv_block = inv(block)
+            for ii, i in enumerate(s):
+                for jj, j in enumerate(s):
+                    J[i, j] -= inv_block[ii, jj]
+        # Don't zero diagonal - LOGO keeps diagonal of inverse covariance
+        self._J = J.tocsr()
